@@ -140,9 +140,12 @@ CODE_BAD_PARAM = 1100109       # 商品可选参数不对
 CODE_RATE_LIMIT = 408          # 访问频率过快（开抢瞬间大家都快）
 CODE_BUSY = 1100205            # 系统繁忙（开抢瞬间服务端排队）
 CODE_CONCURRENT = 1100110      # 正在执行其他操作（同账号有单在提交）
+CODE_NEED_FACE = 1100202       # 需人脸核身（融合自 Allenalonel 版：开抢窗口内才暴露，必提前预警）
+CODE_UNPAID = 1101411          # 有未支付订单占坑（融合自 Allenalonel 版：先付款/取消才能再抢）
 
 # 这几个重试没有意义，命中就停，别浪费窗口
-NO_RETRY_CODES = {CODE_ALREADY_BOUGHT, CODE_NO_QUALIFY, CODE_BAD_PARAM}
+NO_RETRY_CODES = {CODE_ALREADY_BOUGHT, CODE_NO_QUALIFY, CODE_BAD_PARAM,
+                  CODE_NEED_FACE, CODE_UNPAID}
 
 # 登录态失效：重试无意义，应立即中止并提示重新扫码（2026-11-01 10:00 实战:
 # 白打 260 次全是 NOT-LOGINED，就是因为没把它当致命码）
@@ -159,6 +162,8 @@ CODE_DESC = {
     CODE_RATE_LIMIT: "访问频率限制（开抢瞬间大家都在抢），继续",
     CODE_BUSY: "系统繁忙（开抢瞬间排队），继续",
     CODE_CONCURRENT: "同账号有订单正在处理，继续",
+    CODE_NEED_FACE: "需人脸核身——请先去 face_authentication 完成验证",
+    CODE_UNPAID: "有未支付订单占坑——请先付款或取消该订单",
 }
 
 # 提前多少秒开始预热连接 (在目标时间前)
@@ -640,6 +645,34 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
     return success
 
 
+async def precheck_face(page):
+    """开抢前查人脸核身状态 (user/get-facecheck-info, 无害不产生订单)。
+
+    融合自 Allenalonel 版: 1100202(需人脸) 在开抢窗口内才返回, 等那时发现
+    就来不及了; ever_pass 可提前预警. 查不到/异常不阻塞流程, 只打日志.
+    """
+    try:
+        r = await page.evaluate("""
+            () => fetch('https://act-api.cloud.tencent.com/user/get-facecheck-info', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json',
+                          'x-csrf-token': window.__latestCsrf || ''},
+                credentials: 'include', body: '{}'})
+                .then(r => r.json())
+                .catch(e => ({__err: String(e)}))
+        """)
+        if r.get("code") != 0:
+            log(f"⚠️ 人脸核身状态查询异常: {r.get('code')} (不阻塞, 可继续)")
+            return
+        if (r.get("data") or {}).get("ever_pass"):
+            log("✅ 人脸核身已通过 (ever_pass)")
+        else:
+            log("🚨 账号未做人脸核身, 开抢必报 1100202! 请先去 "
+                "https://cloud.tencent.com/act/pro/face_authentication 完成")
+    except Exception as e:
+        log(f"⚠️ 人脸核身预检失败: {str(e)[:60]} (不阻塞)")
+
+
 def find_nearest_time(offset_ms=0):
     """找最近的抢购场次"""
     now = datetime.fromtimestamp((int(time.time() * 1000) + offset_ms) / 1000)
@@ -691,6 +724,10 @@ async def run(target_time=None, test_mode=False):
         # 保存登录状态
         await ctx.storage_state(path=str(STATE_PATH))
         log("登录状态已保存")
+
+        # 开抢前自动人脸核身预检（融合自 Allenalonel 版）:
+        # 1100202 在开抢窗口内才暴露, 那时已来不及, 提前查 ever_pass 预警
+        await precheck_face(page)
 
         # 同步时间
         offset_ms = await sync_time(page)

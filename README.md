@@ -134,3 +134,16 @@ pip install -r requirements.txt
 ## License
 
 MIT
+## 本 fork 增强（相对上游 djs-91）
+
+- **登录失效秒停**：`NOT-LOGINED`/`CSRF-ERROR` 归为致命码，预热与抢购命中立即中止并提示重新扫码（上游会把它们当"未知返回码"白打整场窗口）
+- **默认抢广州**：`GOODS_PARAM.regionId=1`（上游默认北京 8），全链路统一
+- **动态下单参数**：`discover_flash_sale` 优先用服务端下发的 `defaultGoodsParam`（含最新 `imageId`/`type`），活动期号一变自动跟随，避免硬编码过期报 `1100109`
+- **错误码补全**：融合 Allenalonel 版 —— `1100202`(需人脸)、`1101411`(有未付单) 均为致命码，命中即停
+- **开抢前自动人脸核身预检**：`precheck_face()` 查 `ever_pass`，未过提前预警（`1100202` 在窗口内才暴露，届时来不及）
+- **辅助脚本**：
+  - `auth_monitor.py`：登录态无害验证（`get-vip-info`，不产生订单），60s 一次，失效即报警
+  - `bootstrap_login.py`：免菜单扫码登录（复用 `seckill_ui.do_login`）
+  - `facecheck_dj.py`：人脸核身页引导 + 轮询 `ever_pass`
+
+> 安全：`.state.json`(登录态)/`config.json`/`*.log`/`.face_ok` 均已 `.gitignore` 排除，不会随仓库泄露。
