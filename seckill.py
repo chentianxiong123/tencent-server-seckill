@@ -134,6 +134,11 @@ BACKOFF_408_S = 1.5
 # 提前 1.5s 足够覆盖对时误差（毫秒级），又不会过早挤进限流窗口。
 ADVANCE_MS = -1500
 
+# business 字段：None=不带（djs-91 路径，今天 15:00 实测安全）；
+# 想试 Allenalonel/tmetu 的带 business 玩法，填 {"id": <当期值>, "from": "lightningDeals"}。
+# 注意 id 每期可能变，写死过期会报 1100109(参数不对) → 致命中止，需抓包核对。
+BUSINESS = None
+
 # ---- do-goods 业务返回码 ----
 CODE_OK = 0
 CODE_NOT_STARTED = 1101001     # 秒杀尚未开始（没到点 / 本场已结束）
@@ -514,10 +519,10 @@ async def discover_flash_sale(page, region_id=None):
 async def do_goods_raw(page, goods, preview=0, concurrency=1):
     """调 do-goods。preview=1 是预检：服务端完整校验，但不产生订单。
     返回 list（并发时有多条）。"""
-    # business: 所有成功案例（Allenalonel/tmetu）都带此字段，djs-91 不带。
-    # 成功案例每期抓包核对 BUSINESS.id（每天可能变）；这里用兜底值，若报
-    # 1100109(参数不对) 说明 business.id 过期，需更新。带 business 比不带更可能成。
-    business = goods.get("business") or {"id": 24448, "from": "lightningDeals"}
+    # business 字段：Allenalonel/tmetu 带、djs-91 不带；今天 15:00 实测不带也能
+    # 正常走到 1100136/1101001/408（业务检查），说明非必需。写死 id 每期可能变，
+    # 会报 1100109 致命中止；BUSINESS=None 时按 djs-91 路径不带（实测安全）。
+    business = goods.get("business") or BUSINESS
     result = await page.evaluate("""
         async (params) => {
             const one = () => fetch(params.url, {
@@ -531,7 +536,7 @@ async def do_goods_raw(page, goods, preview=0, concurrency=1):
                              goods_param: params.goods_param}],
                     agent_channel: {fromChannel: '', fromSales: '', fromUrl: '',
                                     isAgentClient: false},
-                    business: params.business,
+                    ...(params.business ? {business: params.business} : {}),
                     preview: params.preview,
                 }),
             }).then(r => r.json()).catch(e => ({code: -1, msg: String((e && e.message) || e)}));
