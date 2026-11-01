@@ -593,19 +593,25 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
 
         attempt += CONCURRENCY
 
-        # 检查结果
-        fatal = False
+        # 先扫整批里有没有成功：并发下单时某一单可能已建成，
+        # 绝不能因为同批更靠前的某条是致命码就 break 掉、漏掉这笔成功单
         for r in batch_result:
-            code = r.get("code")
-            if code is not None:
-                last_code = code
-            if code == CODE_OK:
+            if r.get("code") == CODE_OK:
                 deal = r.get("data", {})
                 log("下单成功")
                 log(f"   订单号: {(deal.get('deal_names') or ['?'])[0]}")
                 log(f"   大单号: {deal.get('big_deal_no') or '?'}")
                 success = True
                 break
+        if success:
+            break
+
+        # 没有成功单，再判致命码
+        fatal = False
+        for r in batch_result:
+            code = r.get("code")
+            if code is not None:
+                last_code = code
             if code not in seen_codes:
                 # 同一种返回码只报一次，避免刷屏；但一定带上服务器的原话
                 seen_codes[code] = 1
@@ -620,7 +626,7 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
                 fatal = True
                 break
 
-        if success or fatal:
+        if fatal:
             break
 
         if attempt % (CONCURRENCY * 20) == 0:
@@ -643,6 +649,35 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
         else:
             log(f"  最后返回码 {last_code}: 未知返回码，把这段日志发个 issue 就行")
     return success
+
+
+async def check_login(page):
+    """早检登录态 (get-vip-info, 无害不产生订单)。
+
+    返回 True 有效 / False 失效 / None 未知。
+    失效就提前中止, 避免像 2026-11-01 10:00 那样白打到开抢前才发现。
+    """
+    try:
+        r = await page.evaluate("""
+            () => fetch('https://act-api.cloud.tencent.com/user/get-vip-info', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json',
+                          'x-csrf-token': window.__latestCsrf || ''},
+                credentials: 'include', body: '{}'})
+                .then(r => r.json()).catch(e => ({__err: String(e)}))
+        """)
+    except Exception as e:
+        log(f"⚠️ 登录态检查失败: {str(e)[:60]} (不阻塞)")
+        return None
+    code = r.get("code")
+    if code == 0:
+        log("✅ 登录态有效 (get-vip-info code=0)")
+        return True
+    if code in AUTH_FAIL_CODES:
+        log(f"🚨 登录态已失效 (code={code})! 开抢必失败。")
+        return False
+    log(f"⚠️ 登录态检查异常返回 code={code} (不阻塞，继续)")
+    return None
 
 
 async def precheck_face(page):
@@ -674,11 +709,14 @@ async def precheck_face(page):
 
 
 def find_nearest_time(offset_ms=0):
-    """找最近的抢购场次"""
+    """找最近的抢购场次。
+
+    不再跳过"仅剩几秒"的场次：宁可立刻开火，也别因为 5 秒之差排到明天。
+    """
     now = datetime.fromtimestamp((int(time.time() * 1000) + offset_ms) / 1000)
     for t in SECKILL_TIMES:
         candidate = datetime.strptime(f"{now.date()} {t}", "%Y-%m-%d %H:%M")
-        if candidate > now + timedelta(seconds=5):
+        if candidate >= now:
             return candidate
     tomorrow = now.date() + timedelta(days=1)
     return datetime.strptime(f"{tomorrow} {SECKILL_TIMES[0]}", "%Y-%m-%d %H:%M")
@@ -725,10 +763,6 @@ async def run(target_time=None, test_mode=False):
         await ctx.storage_state(path=str(STATE_PATH))
         log("登录状态已保存")
 
-        # 开抢前自动人脸核身预检（融合自 Allenalonel 版）:
-        # 1100202 在开抢窗口内才暴露, 那时已来不及, 提前查 ever_pass 预警
-        await precheck_face(page)
-
         # 同步时间
         offset_ms = await sync_time(page)
 
@@ -747,8 +781,18 @@ async def run(target_time=None, test_mode=False):
         else:
             log("未捕获到 CSRF token，请求可能失败")
 
+        # 登录态早检: 失效就立刻中止, 别等到开抢前 10 秒才发现 (cookie 可能隔夜失效)
+        if await check_login(page) is False:
+            log("本次中止。请运行 bootstrap_login.py 重新扫码登录后再开抢。")
+            return
+
+        # 开抢前自动人脸核身预检（融合自 Allenalonel 版）:
+        # 1100202 在开抢窗口内才暴露, 那时已来不及, 提前查 ever_pass 预警
+        await precheck_face(page)
+
         # 现查当前在售场次与商品 id（腾讯换了活动也能自动跟上，不用改代码）
         region_id = goods["goods_param"].get("regionId", 8)
+        session = None
         if not test_mode:
             found, session = await discover_flash_sale(page, region_id)
             if session:
@@ -780,13 +824,16 @@ async def run(target_time=None, test_mode=False):
             return
 
         # 等待抢购时间
+        now = datetime.fromtimestamp((int(time.time() * 1000) + offset_ms) / 1000)
         if target_time:
-            now = datetime.fromtimestamp((int(time.time() * 1000) + offset_ms) / 1000)
             target_dt = datetime.strptime(f"{now.date()} {target_time}", "%Y-%m-%d %H:%M")
+        elif session and session.get("started"):
+            # 已经在场次窗口内（比如 15:02 才启动），别排到明天，直接开火
+            log(f"当前场次已开始 ({session['start']} 起)，立即开抢")
+            target_dt = now
         else:
             target_dt = find_nearest_time(offset_ms)
 
-        now = datetime.fromtimestamp((int(time.time() * 1000) + offset_ms) / 1000)
         wait_sec = (target_dt - now).total_seconds()
         log(f"目标: {target_dt.strftime('%Y-%m-%d %H:%M:%S')} (服务器时间)")
         log(f"等待 {wait_sec:.0f}s ({wait_sec/60:.1f}min)")
