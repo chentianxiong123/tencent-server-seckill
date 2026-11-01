@@ -111,25 +111,28 @@ def fmt_price(price):
 
 SECKILL_TIMES = ["10:00", "15:00"]
 
-# 并发请求数
+# 每轮并发的请求数（同一批打向同一地域，服务端按账号限1，多发无害）
 CONCURRENCY = 10
 
-# 持续发送时间 (秒)
-DURATION_SEC = 10
+# 持续发送时间 (秒)：Allenalonel 实战用 30 秒窗口，成功即停，比上游 10 秒强
+DURATION_SEC = 30
 
-# 每轮间隔 (毫秒)
+# 每轮间隔 (毫秒)：作为 ROUND_GAP_S 兜底（新逻辑用秒级轮间+抖动）
 ROUND_INTERVAL_MS = 20
+
+# 轮间基础间隔(秒) + 抖动上限：首轮直打，轮间喘息降限流（Allenalonel 实战参数）
+ROUND_GAP_S = 0.35
+ROUND_JITTER_S = 0.25
+
+# 触发限流(408)后的退避秒数：退避一下再继续，比硬打更可能等到服务端松口
+BACKOFF_408_S = 1.5
 
 # 提前多少毫秒开火（负数=提前，相对本机推算出的开抢时刻）
 #
-# 恢复成早期版本的 3 秒：对时永远有误差（采样取中位数，实测 ±0.1s，抖动更大），
-# 早发只是换来几条「1101001 秒杀尚未开始」，循环会继续打，不损失任何机会；
-# 而晚发是直接错过窗口，补不回来。所以宁可早，代价只是多几百条废请求。
-#
-# 唯一的副作用是请求量：3 秒 × 500req/s ≈ 1500 条，可能招活动风控
-# （接口里 anti_brush_version=v3）。如果日志开始出现限流类返回码，
-# 把这里调成 -500 即可，别调成 0。
-ADVANCE_MS = -3000
+# 成功案例（tcti/tmetu/Allenalonel）都用提前 1.5 秒左右，不是 3 秒：
+# 提前太多只会换来一堆 1101001 + 更早触发 408 限流，白白浪费；
+# 提前 1.5s 足够覆盖对时误差（毫秒级），又不会过早挤进限流窗口。
+ADVANCE_MS = -1500
 
 # ---- do-goods 业务返回码 ----
 CODE_OK = 0
@@ -142,6 +145,8 @@ CODE_BUSY = 1100205            # 系统繁忙（开抢瞬间服务端排队）
 CODE_CONCURRENT = 1100110      # 正在执行其他操作（同账号有单在提交）
 CODE_NEED_FACE = 1100202       # 需人脸核身（融合自 Allenalonel 版：开抢窗口内才暴露，必提前预警）
 CODE_UNPAID = 1101411          # 有未支付订单占坑（融合自 Allenalonel 版：先付款/取消才能再抢）
+CODE_SOLD_OUT = 1100136        # 已售罄（开抢瞬间被抢光 / 当前场次无货）
+CODE_SYSTEM_BUSY2 = 1101408    # 系统繁忙（另一种，继续）
 
 # 这几个重试没有意义，命中就停，别浪费窗口
 NO_RETRY_CODES = {CODE_ALREADY_BOUGHT, CODE_NO_QUALIFY, CODE_BAD_PARAM,
@@ -152,7 +157,8 @@ NO_RETRY_CODES = {CODE_ALREADY_BOUGHT, CODE_NO_QUALIFY, CODE_BAD_PARAM,
 AUTH_FAIL_CODES = {"NOT-LOGINED", "CSRF-ERROR", "CSRF-ERROR "}
 
 # 开抢瞬间常见的排队信号：并发请求里有的排队、有的成功，继续就行
-QUEUE_CODES = {CODE_NOT_STARTED, CODE_RATE_LIMIT, CODE_BUSY, CODE_CONCURRENT}
+QUEUE_CODES = {CODE_NOT_STARTED, CODE_RATE_LIMIT, CODE_BUSY, CODE_CONCURRENT,
+               CODE_SOLD_OUT, CODE_SYSTEM_BUSY2}
 
 CODE_DESC = {
     CODE_NOT_STARTED: "秒杀尚未开始（未到时间或本场已结束）",
@@ -164,6 +170,8 @@ CODE_DESC = {
     CODE_CONCURRENT: "同账号有订单正在处理，继续",
     CODE_NEED_FACE: "需人脸核身——请先去 face_authentication 完成验证",
     CODE_UNPAID: "有未支付订单占坑——请先付款或取消该订单",
+    CODE_SOLD_OUT: "已售罄（当前场次被抢光），继续等名额释放",
+    CODE_SYSTEM_BUSY2: "系统繁忙，继续",
 }
 
 # 提前多少秒开始预热连接 (在目标时间前)
@@ -506,6 +514,10 @@ async def discover_flash_sale(page, region_id=None):
 async def do_goods_raw(page, goods, preview=0, concurrency=1):
     """调 do-goods。preview=1 是预检：服务端完整校验，但不产生订单。
     返回 list（并发时有多条）。"""
+    # business: 所有成功案例（Allenalonel/tmetu）都带此字段，djs-91 不带。
+    # 成功案例每期抓包核对 BUSINESS.id（每天可能变）；这里用兜底值，若报
+    # 1100109(参数不对) 说明 business.id 过期，需更新。带 business 比不带更可能成。
+    business = goods.get("business") or {"id": 24448, "from": "lightningDeals"}
     result = await page.evaluate("""
         async (params) => {
             const one = () => fetch(params.url, {
@@ -519,6 +531,7 @@ async def do_goods_raw(page, goods, preview=0, concurrency=1):
                              goods_param: params.goods_param}],
                     agent_channel: {fromChannel: '', fromSales: '', fromUrl: '',
                                     isAgentClient: false},
+                    business: params.business,
                     preview: params.preview,
                 }),
             }).then(r => r.json()).catch(e => ({code: -1, msg: String((e && e.message) || e)}));
@@ -533,6 +546,7 @@ async def do_goods_raw(page, goods, preview=0, concurrency=1):
         "act_id": goods["act_id"],
         "type": goods["type"],
         "goods_param": goods.get("goods_param", {}),
+        "business": business,
         "preview": int(preview),
         "concurrency": int(concurrency),
     })
@@ -629,11 +643,21 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
         if fatal:
             break
 
+        # 408 限流：退避 1.5s 再继续（Allenalonel 实战：硬打只会更限流，喘口气等松口）
+        if any(r.get("code") == CODE_RATE_LIMIT for r in batch_result):
+            if CODE_RATE_LIMIT not in seen_codes:
+                seen_codes[CODE_RATE_LIMIT] = 1
+                log(f"  408 限流 → 退避 {BACKOFF_408_S}s 再继续")
+            await asyncio.sleep(BACKOFF_408_S)
+
         if attempt % (CONCURRENCY * 20) == 0:
             elapsed = time.monotonic() - start
             log(f"  已尝试 {attempt} 次 ({elapsed:.1f}s)")
 
-        await asyncio.sleep(ROUND_INTERVAL_MS / 1000)
+        # 轮间喘息：0.35s + 0~0.25s 抖动（Allenalonel 实战：降限流，首轮不打间隔）
+        import random as _rnd
+        gap = ROUND_GAP_S + _rnd.uniform(0, ROUND_JITTER_S)
+        await asyncio.sleep(gap)
 
     elapsed = time.monotonic() - start
     log(f"抢购结束: {attempt} 次请求, {elapsed:.1f}s, {'成功' if success else '未抢到'}")
