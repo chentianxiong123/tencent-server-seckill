@@ -54,7 +54,7 @@ GOODS_PARAM = {
     "scenario": "0",
     "timeSpanUnit": "12m",
     "zone": "",
-    "regionId": 8,  # 地域: 4=上海 8=北京 1=广州 (area=1 内地)
+    "regionId": 1,  # 地域: 4=上海 8=北京 1=广州 (area=1 内地) — 广州
     "type": "bundle_budget_mc_lg4_01",
 }
 
@@ -143,6 +143,10 @@ CODE_CONCURRENT = 1100110      # 正在执行其他操作（同账号有单在�
 
 # 这几个重试没有意义，命中就停，别浪费窗口
 NO_RETRY_CODES = {CODE_ALREADY_BOUGHT, CODE_NO_QUALIFY, CODE_BAD_PARAM}
+
+# 登录态失效：重试无意义，应立即中止并提示重新扫码（2026-11-01 10:00 实战:
+# 白打 260 次全是 NOT-LOGINED，就是因为没把它当致命码）
+AUTH_FAIL_CODES = {"NOT-LOGINED", "CSRF-ERROR", "CSRF-ERROR "}
 
 # 开抢瞬间常见的排队信号：并发请求里有的排队、有的成功，继续就行
 QUEUE_CODES = {CODE_NOT_STARTED, CODE_RATE_LIMIT, CODE_BUSY, CODE_CONCURRENT}
@@ -401,11 +405,12 @@ def _rank_candidate(sale, price):
     return 9
 
 
-async def discover_flash_sale(page, region_id=8):
+async def discover_flash_sale(page, region_id=None):
     """开抢前现查：当前在售场次 + 对应的 act_id / activity_id
 
     腾讯每次换活动都会换 act_id，写死在代码里必然过期（换来的是 1101001）。
     这个接口不需要签名，登录后就能调。拿不到才回落到代码里的兜底值。
+    region_id=None 时用 GOODS_PARAM 默认（广州）。
     返回 (goods, session)，session 为 None 表示用的是兜底值。
     """
     candidates = []
@@ -447,12 +452,15 @@ async def discover_flash_sale(page, region_id=8):
                 if sale.get("act_id") is None:
                     continue
                 typ = sale.get("product_name") or ""
+                # 优先用服务端下发的 defaultGoodsParam（含最新 imageId/type），
+                # 活动期号一变它自动跟随，避免硬编码 imageId 过期 → 1100109
+                gp_src = sale.get("defaultGoodsParam") or sale.get("defaultOrderParam") or GOODS_PARAM
                 goods = {
                     "act_id": int(sale["act_id"]),
                     "activity_id": int(act),
-                    "type": typ or "lighthouse_v5",
+                    "type": typ or gp_src.get("type") or "lighthouse_v5",
                     "name": "轻量4核4G3M (38元/年)",
-                    "goods_param": {**GOODS_PARAM, "regionId": region_id},
+                    "goods_param": {**gp_src, "regionId": region_id if region_id else gp_src.get("regionId", GOODS_PARAM["regionId"])},
                 }
                 price = await fetch_price(page, act, goods["act_id"], goods["type"], region_id)
                 cands.append((_rank_candidate(sale, price), goods, price, sale))
@@ -545,6 +553,8 @@ async def warmup(page, goods):
     elif code in NO_RETRY_CODES:
         log(f"  预热返回 {code}: {CODE_DESC.get(code, '')}")
         log(f"  服务器原话: {str(result.get('msg') or '')[:70]}")
+    elif code in AUTH_FAIL_CODES:
+        log(f"  🚨 登录态失效 (code={code}): 请重新扫码登录后再开抢!")
     elif code == CODE_NOT_STARTED:
         log("  预热完成（还没到场次时间，正常）")
     else:
@@ -598,6 +608,10 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
                     f" | {str(r.get('msg') or '')[:60]}")
             if code in NO_RETRY_CODES:
                 log("  这类错误重试没有意义，本场停止。")
+                fatal = True
+                break
+            if code in AUTH_FAIL_CODES:
+                log("  🚨 登录态失效，本场停止，请重新扫码登录!")
                 fatal = True
                 break
 
@@ -770,6 +784,9 @@ async def run(target_time=None, test_mode=False):
                 probe = await warmup(page, goods)
                 if probe.get("code") in NO_RETRY_CODES:
                     log("开抢前已知资格不满足，中止本场")
+                    return
+                if probe.get("code") in AUTH_FAIL_CODES:
+                    log("开抢前已知登录态失效，中止本场")
                     return
 
             await asyncio.sleep(0.05 if remaining <= 5 else 1)

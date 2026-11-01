@@ -3,3 +3,5 @@ venv/
 .state.json
 config.json
 *.log
+.face_ok
+auth_status.txt
