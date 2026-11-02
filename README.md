@@ -1,5 +1,7 @@
 # 腾讯云服务器抢购助手
 
+> ⚠️ **本项目已归档冻结（2026-11-02）**：不再维护，改用上游 [djs-91/tencent-server-seckill](https://github.com/djs-91/tencent-server-seckill) 最新版（本地 `/home/a1/seckill-upstream`，默认地域已设广州）。本仓库仅留档历史，后续如有需要请跟进上游。
+
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
