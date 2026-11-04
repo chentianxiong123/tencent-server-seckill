@@ -1186,16 +1186,42 @@ MOCK_FIRE_JS = """
         st.fired = 0; st.codes = {}; st.msgs = {};
         st.hit = null; st.fatal = null; st.last = null;
     }
-    const seq = [1101001, 408, 408, 0];   // 探针未开始 → 408×2 → 命中
-    const msgs = {1101001: "抱歉，秒杀尚未开始", 408: "系统访问频率过快，请稍后再试"};
+    // 真实时序模拟:
+    //  - 开窗前(now<open): 100% 1101001 (秒杀尚未开始)
+    //  - 开窗瞬间(0~1s): 大量408洪峰 + 小概率0命中
+    //  - 开窗后(>1s):   逐步转1100136售罄(终局), 极小概率0命中
+    const now_ms = params.now_ms || 0;
+    const open_ms = params.open_at_ms || 0;
+    const msgs = {1101001: "抱歉，秒杀尚未开始", 408: "系统访问频率过快，请稍后再试",
+                  1100136: "抱歉，当前商品已售罄，欢迎选择其他商品",
+                  0: "ok"};
+    const soldOutAt = open_ms + 1000;   // 开窗后1秒开始放售罄
     const n = params.batch || 1;
     for (let i = 0; i < n; i++) {
-        const c = seq[st.fired % seq.length];
+        let c;
+        if (!open_ms || now_ms < open_ms) {
+            c = 1101001;                          // 未开窗 → 秒杀尚未开始
+        } else {
+            const since = now_ms - open_ms;
+            const r = Math.random();
+            if (since < 1000) {
+                // 开窗前1秒: 85%限流, 12%未开始, 3%命中
+                if (r < 0.85) c = 408;
+                else if (r < 0.97) c = 1101001;
+                else c = 0;
+            } else {
+                // 1秒后: 70%售罄, 25%限流, 4%未开始, 1%命中
+                if (r < 0.70) c = 1100136;
+                else if (r < 0.95) c = 408;
+                else if (r < 0.99) c = 1101001;
+                else c = 0;
+            }
+        }
         st.fired++;
         st.codes[c] = (st.codes[c] || 0) + 1;
         if (!st.msgs[c] && msgs[c]) st.msgs[c] = msgs[c];
         if (c === 0 && !st.hit) st.hit = {code: 0, msg: "ok",
-            data: {deal_names: ["MOCK-ORDER-20261103"], big_deal_no: "BIG-MOCK-001"}};
+            data: {deal_names: ["MOCK-ORDER-20261104"], big_deal_no: "BIG-MOCK-002"}};
         if ([1100106, 1100107, 1100109, 1100136].indexOf(c) >= 0 && !st.fatal) st.fatal = c;
         st.last = c;
     }
@@ -1231,6 +1257,9 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None, mock=
         "reset": True,
         "stop": False,
     }
+    if mock and open_at is not None:
+        # 真实时序: mock按"开窗服务器毫秒"判断未开始/洪峰/售罄
+        params["open_at_ms"] = int(time.time() * 1000 + _server_time_offset_seconds * 1000 + open_in * 1000)
 
     start = time.monotonic()
     success = False
@@ -1258,6 +1287,7 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None, mock=
         params["reset"] = False
         try:
             if mock:
+                params["now_ms"] = int(time.time() * 1000 + _server_time_offset_seconds * 1000)
                 result = await page.evaluate(MOCK_FIRE_JS, params) or {}
             else:
                 result = await page.evaluate(FIRE_JS, params) or {}
@@ -1335,6 +1365,7 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None, mock=
         deadline = time.monotonic() + 2.5
         while True:
             if mock:
+                params["now_ms"] = int(time.time() * 1000 + _server_time_offset_seconds * 1000)
                 result = await page.evaluate(MOCK_FIRE_JS, params) or {}
             else:
                 result = await page.evaluate(FIRE_JS, params) or {}
@@ -1764,7 +1795,8 @@ async def main():
             break
         await asyncio.sleep(min(1.0, max(0.05, remaining - QUIET_SECONDS)))
 
-    open_in = 3.0 if mock_mode else (target_ms - _srv_ms()) / 1000
+    # mock也走真实时间线: 提前ADVANCE_MS开始探针, 开窗瞬间全速(与真实抢购完全一致)
+    open_in = (target_ms - _srv_ms()) / 1000
     success = await rapid_purchase(page, goods, open_in=open_in, mock=mock_mode)
 
     if success:
