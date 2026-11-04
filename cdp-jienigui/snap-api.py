@@ -29,9 +29,12 @@ CSRF:
 
 import asyncio
 import json
+import os
 import re
+import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -49,6 +52,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 CDP_URL = "http://127.0.0.1:9222"
 ACTIVITY_ID = 166111704417621  # 2026 双十一活动期
+COOKIE_BACKUP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "login_backup.json")
 
 SECKILL_HOURS = [10, 15]
 
@@ -77,6 +81,9 @@ CODE_SOLD_OUT = 1100136      # 已售罄
 
 # 命中就停的码: 重试无意义
 NO_RETRY_CODES = {CODE_ALREADY_BOUGHT, CODE_NO_QUALIFY, CODE_BAD_PARAM, CODE_SOLD_OUT}
+
+# 排队继续的码: 开抢瞬间都正常, 继续发
+QUEUE_CODES = {CODE_NOT_STARTED, CODE_RATE_LIMIT, CODE_BUSY, CODE_CONCURRENT}
 
 CODE_DESC = {
     CODE_NOT_STARTED: "秒杀尚未开始(未到时间或本场已结束)",
@@ -196,38 +203,57 @@ def calc_csrf_code(skey: str) -> int:
 
 async def get_csrf_token(page) -> str:
     global _csrf_token
-    
-    skey_val = await page.evaluate("""
-        () => {
-            const cookies = document.cookie;
-            const skeyMatch = cookies.match(/(?:^|;\\s*)skey=([^;]+)/);
-            const pSkeyMatch = cookies.match(/(?:^|;\\s*)p_skey=([^;]+)/);
-            return skeyMatch ? skeyMatch[1] : (pSkeyMatch ? pSkeyMatch[1] : '');
-        }
-    """)
-    
-    if skey_val:
-        _csrf_token = str(calc_csrf_code(skey_val))
-        log(f"  X-CSRF-TOKEN 从skey计算: {_csrf_token}")
-        return _csrf_token
-    
+
+    # 优先用CDP读浏览器全部cookie(不依赖页面域, 任何页面都行)
+    # 注意: 浏览器里新旧skey可能并存(如.dnspod.cn残留旧值),
+    # 必须优先取.cloud.tencent.cn域的主skey, 否则算出错token导致CSRF-ERROR
+    skey_val = ""
     try:
         cdp = await page.context.new_cdp_session(page)
         cookies_result = await cdp.send('Network.getAllCookies')
-        for cookie in cookies_result.get('cookies', []):
-            name = cookie.get('name', '')
-            if name == 'skey' or name == 'p_skey':
-                skey_val = cookie.get('value', '')
-                break
         await cdp.detach()
+        all_cookies = cookies_result.get('cookies', [])
+        # 优先级: .cloud.tencent.cn > .cloud.tencent.com > .qcloud.com > 任意
+        for dom in ('cloud.tencent.cn', 'cloud.tencent.com', 'qcloud.com'):
+            for cookie in all_cookies:
+                if cookie.get('name') in ('skey', 'p_skey') and cookie.get('value') \
+                   and dom in cookie.get('domain', ''):
+                    skey_val = cookie['value']
+                    break
+            if skey_val:
+                break
+        if not skey_val:
+            for cookie in all_cookies:
+                if cookie.get('name') in ('skey', 'p_skey') and cookie.get('value'):
+                    skey_val = cookie['value']
+                    break
     except Exception as e:
         log(f"  CDP获取cookie失败: {e}")
-    
+
     if skey_val:
         _csrf_token = str(calc_csrf_code(skey_val))
         log(f"  X-CSRF-TOKEN 从CDP获取skey计算: {_csrf_token}")
         return _csrf_token
-    
+
+    # 兜底: 页面evaluate读document.cookie(需腾讯域)
+    try:
+        skey_val = await page.evaluate("""
+            () => {
+                const cookies = document.cookie;
+                const skeyMatch = cookies.match(/(?:^|;\\s*)skey=([^;]+)/);
+                const pSkeyMatch = cookies.match(/(?:^|;\\s*)p_skey=([^;]+)/);
+                return skeyMatch ? skeyMatch[1] : (pSkeyMatch ? pSkeyMatch[1] : '');
+            }
+        """)
+    except Exception as e:
+        log(f"  页面evaluate读cookie失败: {e}")
+        skey_val = ""
+
+    if skey_val:
+        _csrf_token = str(calc_csrf_code(skey_val))
+        log(f"  X-CSRF-TOKEN 从skey计算: {_csrf_token}")
+        return _csrf_token
+
     log("  ⚠ 无法获取skey/p_skey!")
     return ""
 
@@ -281,8 +307,52 @@ async def api_fetch(page, url: str, body: dict) -> dict:
 # 连接Chrome
 # ============================================================
 
+CHROME_PROFILE = "/home/a1/chrome-cdp-profile"
+ACTIVITY_PAGE_URL = "https://cloud.tencent.com/act/pro/double11-202611"
+
+def _cdp_alive() -> bool:
+    try:
+        with urllib.request.urlopen(CDP_URL + "/json/version", timeout=2) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+def ensure_chrome():
+    """若9222未启动, 自动拉起Chrome(带活动页URL), 等待就绪。"""
+    if _cdp_alive():
+        log("  Chrome 9222 已在运行")
+        return True
+    log("  Chrome 9222 未运行，自动启动...")
+    for f in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        p = os.path.join(CHROME_PROFILE, f)
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+    try:
+        subprocess.Popen(
+            ["/usr/bin/google-chrome",
+             "--remote-debugging-port=9222",
+             f"--user-data-dir={CHROME_PROFILE}",
+             ACTIVITY_PAGE_URL],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        log(f"  启动Chrome失败: {e}")
+        return False
+    for _ in range(30):
+        time.sleep(1)
+        if _cdp_alive():
+            log("  Chrome 已就绪")
+            return True
+    log("  ⚠ Chrome 启动超时")
+    return False
+
 async def connect_chrome():
     log("正在连接 Chrome CDP...")
+    ensure_chrome()
     playwright = await async_playwright().start()
     try:
         browser = await playwright.chromium.connect_over_cdp(CDP_URL)
@@ -317,23 +387,92 @@ async def connect_chrome():
 
     log(f"已连接，当前页面: {target_page.url[:80]}")
 
+    # 若页面不在腾讯域(如about:blank), 自动导航到活动页
+    if "cloud.tencent.com" not in target_page.url:
+        log("  页面不在腾讯域，自动导航到活动页...")
+        try:
+            await asyncio.wait_for(
+                target_page.goto(
+                    "https://cloud.tencent.com/act/pro/double11-202611",
+                    wait_until="domcontentloaded", timeout=20000
+                ),
+                timeout=25
+            )
+            log(f"  导航完成: {target_page.url[:80]}")
+        except Exception as e:
+            log(f"  自动导航失败: {e}")
+
+    # 恢复登录态: 若有备份文件, 全量写回浏览器(解决Chrome重启丢session cookie)
+    if os.path.exists(COOKIE_BACKUP_FILE):
+        try:
+            import json as _json
+            with open(COOKIE_BACKUP_FILE, "r") as f:
+                backup_cookies = _json.load(f)
+            cdp = await target_page.context.new_cdp_session(target_page)
+            set_cnt = 0
+            for ck in backup_cookies:
+                try:
+                    # 忽略已过期
+                    if ck.get("expires", -1) and 0 < ck["expires"] < time.time():
+                        continue
+                    await cdp.send("Network.setCookie", {
+                        "name": ck["name"], "value": ck["value"],
+                        "domain": ck["domain"], "path": ck.get("path", "/"),
+                        "secure": bool(ck.get("secure", False)),
+                        "httpOnly": bool(ck.get("httpOnly", False)),
+                        **({"expires": ck["expires"]} if ck.get("expires", -1) > 0 else {}),
+                        **({"sameSite": ck["sameSite"]} if ck.get("sameSite") in ("Strict", "Lax", "None") else {}),
+                    })
+                    set_cnt += 1
+                except Exception:
+                    pass
+            await cdp.detach()
+            log(f"恢复登录态: 写回 {set_cnt} 条cookie (来自 {COOKIE_BACKUP_FILE})")
+            # 刷新页面让UI读取新cookie(否则登录态要手动刷新才生效)
+            if set_cnt > 0:
+                try:
+                    await asyncio.wait_for(
+                        target_page.reload(wait_until="domcontentloaded", timeout=20000),
+                        timeout=25
+                    )
+                    log("  已自动刷新页面, 登录态UI应已生效")
+                except Exception as e:
+                    log(f"  自动刷新页面失败(不影响API登录态): {e}")
+        except Exception as e:
+            log(f"恢复登录态失败: {e}")
+    else:
+        log(f"无登录态备份文件({COOKIE_BACKUP_FILE}), 跳过恢复")
+
+    # 登录态真实校验: ① CDP读.cn纯数字uin ② 调check-available(腾讯端认不认)
+    login_ok = False
+    nick_shown = ""
     try:
-        nick = await target_page.evaluate("""
-            () => {
-                const el = document.querySelector('[class*="user-name"], [class*="nickname"]');
-                if (el) {
-                    const t = el.textContent.trim();
-                    if (t && t.length < 30) return t.substring(0, 20);
-                }
-                return document.cookie.includes('uin=') ? '(已登录)' : null;
-            }
-        """)
-        if nick:
-            log(f"已登录: {nick}")
+        cdp = await target_page.context.new_cdp_session(target_page)
+        cookies_result = await cdp.send('Network.getAllCookies')
+        await cdp.detach()
+        all_cookies = cookies_result.get('cookies', [])
+        cn_uin = next((c['value'] for c in all_cookies
+                       if c['name'] == 'uin' and 'cloud.tencent.cn' in c['domain']
+                       and c['value'].isdigit()), None)
+        if not cn_uin:
+            log("⚠ 无 .cn 纯数字uin, 登录态无效(疑似微信态/未登录)")
         else:
-            log("⚠ 未检测到登录状态!")
+            chk = await api_fetch(target_page,
+                "https://act-api.cloud.tencent.com/dianshi/check-available",
+                {"activity_id": ACTIVITY_ID,
+                 "goods": [{"act_id": 1996855673581677, "region_id": [1]}],
+                 "preview": 0})
+            chk_code = (chk.get("data") or {}).get("code")
+            if chk_code == 0:
+                login_ok = True
+                log("已登录: 登录态校验通过 (check-available code=0)")
+            else:
+                log(f"⚠ 登录态校验失败: check-available code={chk_code} msg={(chk.get('data') or {}).get('msg','')}")
     except Exception as e:
         log(f"登录检测异常: {e}")
+
+    if not login_ok:
+        log("⚠⚠ 当前未登录, 请先扫码登录后再跑! (否则抢购会返回 NOT-LOGINED)")
 
     return playwright, browser, context, target_page
 
@@ -1343,6 +1482,35 @@ async def main():
     dry_run = "--dry-run" in sys.argv
     run_now = "--now" in sys.argv
     mock_mode = "--mock" in sys.argv
+    backup_login = "--backup-login" in sys.argv
+
+    if backup_login:
+        # 登录后立即备份全量cookies(解决Chrome重启丢session cookie)
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.connect_over_cdp(CDP_URL)
+        context = browser.contexts[0] if browser.contexts else None
+        if not context:
+            print("无浏览器上下文")
+            await playwright.stop()
+            sys.exit(1)
+        page = next((pg for pg in context.pages if "cloud.tencent.com" in pg.url), None) or context.pages[0]
+        cdp = await context.new_cdp_session(page)
+        cr = await cdp.send("Network.getAllCookies")
+        await cdp.detach()
+        cookies = cr.get("cookies", [])
+        with open(COOKIE_BACKUP_FILE, "w") as f:
+            json.dump(cookies, f, indent=2)
+        # 统计
+        cn_uin = next((c["value"] for c in cookies
+                       if c["name"] == "uin" and "cloud.tencent.cn" in c["domain"]
+                       and c["value"].isdigit()), None)
+        skey_cnt = sum(1 for c in cookies if c["name"] in ("skey", "p_skey") and c.get("value"))
+        print(f"已备份 {len(cookies)} 条cookie -> {COOKIE_BACKUP_FILE}")
+        print(f"  .cn纯数字uin: {cn_uin or '(无)'}  skey条数: {skey_cnt}")
+        print("  登录后立即跑 --backup-login, 之后每次启动会自动恢复登录态")
+        await browser.close()
+        await playwright.stop()
+        sys.exit(0)
 
     _open_log()
     log("=" * 60)
@@ -1368,6 +1536,21 @@ async def main():
 
     # ---- 设置CSRF头注入 ----
     await setup_api_route(page)
+
+    # ---- 真实登录态校验 (token已就位, 能过CSRF) ----
+    log("校验登录态(腾讯端)...")
+    try:
+        chk = await check_available(page, ACTIVITY_ID, 1996855673581677, [1])
+        chk_code = (chk.get("data") or {}).get("code")
+        if chk_code == 0:
+            log("  ✓ 登录态有效 (check-available code=0)")
+        else:
+            log(f"  ⚠ 登录态无效: code={chk_code} msg={(chk.get('data') or {}).get('msg','')}")
+            log("  ⚠⚠ 未登录! 请重新扫码登录后再跑, 否则抢购会返回 NOT-LOGINED")
+            await playwright.stop()
+            sys.exit(1)
+    except Exception as e:
+        log(f"  登录态校验异常: {e}")
 
     # 从React fiber优先提取当前页面的activity_id和act_id
     log("从React fiber提取活动参数...")
