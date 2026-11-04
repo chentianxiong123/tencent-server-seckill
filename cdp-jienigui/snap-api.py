@@ -472,7 +472,9 @@ async def connect_chrome():
         log(f"登录检测异常: {e}")
 
     if not login_ok:
-        log("⚠⚠ 当前未登录, 请先扫码登录后再跑! (否则抢购会返回 NOT-LOGINED)")
+        # 此校验在CSRF token注入前执行, CSRF-ERROR不代表未登录;
+        # 真实登录判定由main里token就位后的check-available决定
+        log("  预检: 登录态待确认(CSRF token未注入, 由二次校验决定)")
 
     return playwright, browser, context, target_page
 
@@ -1199,7 +1201,10 @@ MOCK_FIRE_JS = """
     const n = params.batch || 1;
     for (let i = 0; i < n; i++) {
         let c;
-        if (!open_ms || now_ms < open_ms) {
+        // 固定序列模式: params.seq非空则按序列出码(用于验证返回码处理逻辑)
+        if (params.seq && params.seq.length) {
+            c = params.seq[st.fired % params.seq.length];
+        } else if (!open_ms || now_ms < open_ms) {
             c = 1101001;                          // 未开窗 → 秒杀尚未开始
         } else {
             const since = now_ms - open_ms;
@@ -1288,6 +1293,13 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None, mock=
         try:
             if mock:
                 params["now_ms"] = int(time.time() * 1000 + _server_time_offset_seconds * 1000)
+                _seq = os.environ.get("MOCK_SEQ", "")
+                if _seq:
+                    try:
+                        params["seq"] = [int(x) if x.lstrip("-").isdigit() else x
+                                         for x in _seq.split(",") if x.strip()]
+                    except Exception:
+                        params["seq"] = None
                 result = await page.evaluate(MOCK_FIRE_JS, params) or {}
             else:
                 result = await page.evaluate(FIRE_JS, params) or {}
