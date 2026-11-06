@@ -331,11 +331,22 @@ def ensure_chrome():
         except Exception:
             pass
     try:
+        chrome_args = [
+            "/usr/bin/google-chrome",
+            "--remote-debugging-port=9222",
+            f"--user-data-dir={CHROME_PROFILE}",
+        ]
+        # 强制 act-api 走 IPv6 (USE_IPV6=1), 绕开 IPv4 出口限流
+        if os.environ.get("USE_IPV6") == "1":
+            chrome_args.append(
+                "--host-resolver-rules="
+                "MAP act-api.cloud.tencent.com 2408:875c:0:43:6f::31,"
+                "MAP dianshi.cloud.tencent.com 2408:875c:0:43:6f::31"
+            )
+            log("  ★ 强制 act-api 走 IPv6 (2408:875c:0:43:6f::31)")
+        chrome_args.append(ACTIVITY_PAGE_URL)
         subprocess.Popen(
-            ["/usr/bin/google-chrome",
-             "--remote-debugging-port=9222",
-             f"--user-data-dir={CHROME_PROFILE}",
-             ACTIVITY_PAGE_URL],
+            chrome_args,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
