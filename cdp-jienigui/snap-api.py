@@ -1154,10 +1154,11 @@ FIRE_JS = """
     }
     if (params.stop) st.stopped = true;
 
-    const body = JSON.stringify({
+    const regions = (params.regions && params.regions.length) ? params.regions : null;
+    const mkbody = (gp) => JSON.stringify({
         activity_id: params.activity_id,
         goods: [{act_id: params.act_id, type: params.type,
-                 goods_param: params.goods_param, page_from: "act_buy"}],
+                 goods_param: gp, page_from: "act_buy"}],
         preview: params.preview,
         agent_channel: {fromChannel: '', fromSales: '', isAgentClient: false,
                         fromUrl: location.href, agent_key: ''},
@@ -1166,11 +1167,16 @@ FIRE_JS = """
     let n = 0;
     while (n < params.batch && st.inflight < params.cap && !st.stopped && !st.hit && !st.fatal) {
         st.inflight++; st.fired++; n++;
+        let gp = params.goods_param;
+        if (regions) {
+            // 闪电波: 每轮并发轮转多地域, 前len(regions)条即各地域各1(同步发=Promise.all效果)
+            gp = Object.assign({}, params.goods_param, {regionId: regions[(st.fired - 1) % regions.length]});
+        }
         fetch(params.url, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             credentials: 'include',
-            body: body,
+            body: mkbody(gp),
         }).then(r => r.json()).then(d => {
             st.inflight--; st.done++;
             const c = (d && d.code !== undefined && d.code !== null) ? d.code : -1;
@@ -1250,9 +1256,10 @@ MOCK_FIRE_JS = """
 """
 
 
-async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None, mock=False):
+async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None, mock=False, regions=None):
     """上游策略: 开窗前每200ms探针, 最后0.6秒全速(30并发回来补一)。
     open_in: 距开窗秒(None=直接全速)。408/1100205继续, 售罄/资格/字符串码停。
+    regions: 多地域闪电波(每轮轮转并发发, None=单地域用goods_param.regionId)。
     mock=True: 用MOCK_FIRE_JS纯本地模拟, 零网络(不发fetch), 不出网。"""
     open_at = None if open_in is None else time.monotonic() + open_in
     ramp_at = None if open_at is None else open_at - PRE_OPEN_FIRE_MS / 1000
@@ -1268,6 +1275,7 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None, mock=
         "act_id": goods["act_id"],
         "type": goods["type"],
         "goods_param": goods.get("goods_param", {}),
+        "regions": list(regions) if regions else None,
         "preview": 0,
         "cap": int(INFLIGHT),
         "batch": int(INFLIGHT),
@@ -1783,10 +1791,10 @@ async def main():
     await get_server_time(page)
 
     # ============================================================
-    # 上游(djs-91)策略: 单地域广州 + 提前2秒 + 开窗0.6秒全速30并发
+    # 缝合策略: 压线提前量(随机抖动防识别) + 多地域闪电波(regions轮转并发)
+    # + 二连(第一轮未成功500ms后再打) + 低并发15
     # 不调prepare-do(上游证明不需要); 不用preview=1(用户禁止)
     # ============================================================
-    TARGET_REGION = 1
     goods = {
         "activity_id": activity_id,
         "act_id": target_act_id,
@@ -1794,13 +1802,13 @@ async def main():
         "goods_param": {
             "zone": "", "timeSpanUnit": "12m", "scenario": "0",
             "goodsNum": 1, "ddocUnionConnect": 0, "area": 1,
-            "BlueprintId": "LINUX_UNIX", "regionId": TARGET_REGION,
+            "BlueprintId": "LINUX_UNIX", "regionId": 1,
             "imageId": image_id_strategies[0],
             "type": goods_type,
         },
     }
     log(f"  抢购商品: act_id={target_act_id}, type={goods_type}, "
-        f"地域=广州({TARGET_REGION}), imageId={image_id_strategies[0]}")
+        f"多地域闪电波={region_ids}, imageId={image_id_strategies[0]}")
 
     def _srv_ms():
         return int(time.time() * 1000 + _server_time_offset_seconds * 1000)
@@ -1827,11 +1835,11 @@ async def main():
 
     # mock也走真实时间线: 提前ADVANCE_MS开始探针, 开窗瞬间全速(与真实抢购完全一致)
     open_in = (target_ms - _srv_ms()) / 1000
-    success = await rapid_purchase(page, goods, open_in=open_in, mock=mock_mode)
+    success = await rapid_purchase(page, goods, open_in=open_in, mock=mock_mode, regions=region_ids)
     if not success:
         log(f"第一轮未成功, {SECOND_DELAY_MS}ms 后二连(直接全速不等开窗)")
         await asyncio.sleep(SECOND_DELAY_MS / 1000)
-        success = await rapid_purchase(page, goods, open_in=0, mock=mock_mode)
+        success = await rapid_purchase(page, goods, open_in=0, mock=mock_mode, regions=region_ids)
 
     if success:
         log("★ 抢购成功! 请去Chrome中完成支付!")
