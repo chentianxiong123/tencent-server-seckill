@@ -1835,7 +1835,10 @@ async def main():
 
     if success:
         log("★ 抢购成功! 请去Chrome中完成支付!")
-        await page.evaluate("window.open('https://buy.cloud.tencent.com/order','_blank')")
+        if not mock_mode:
+            await page.evaluate("window.open('https://buy.cloud.tencent.com/order','_blank')")
+        else:
+            log("  (mock模式: 不出网, 不打开真实订单页)")
     else:
         log("✗ 未抢到, 看上面各码次数判断卡在哪")
 
