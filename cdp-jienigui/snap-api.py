@@ -30,6 +30,7 @@ CSRF:
 import asyncio
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -65,6 +66,8 @@ PRE_OPEN_FIRE_MS = 600  # 开窗前0.6秒全速铺开, 让第一批压在开窗�
 PROBE_MS = 200          # 开窗前探针间隔(毫秒)
 DURATION_SEC = 10       # 持续发送时间(秒)
 ADVANCE_MS = -150       # 压线: 第一波压到开窗0ms到(不提前刷408, 不晚错过), 靠对时保证
+ADVANCE_JITTER_MS = 150 # 提前量随机抖动(0~150ms): 防anti_brush识别固定触发模式(借鉴servergrab rand 200-600ms)
+SECOND_DELAY_MS = 500   # 二连间隔: 第一轮未成功后500ms第二轮直接全速(借鉴servergrab second_delay_ms)
 QUIET_SECONDS = 15      # 最后15秒纯等待, 一次网络请求都不发
 DO_GOODS_URL = "https://act-api.cloud.tencent.com/dianshi/do-goods"
 
@@ -1805,22 +1808,30 @@ async def main():
     target_ms = int(next_seckill.timestamp() * 1000)
     log(f"目标开窗: {next_seckill.strftime('%H:%M:%S')} (服务器时间)")
 
+    # 本场提前量: 设定-150ms + 随机抖动0~150ms (防固定触发模式被anti_brush识别, 借鉴servergrab)
+    advance_ms = ADVANCE_MS - random.randint(0, ADVANCE_JITTER_MS)
+    log(f"  本场提前量: {advance_ms}ms (设定{ADVANCE_MS}ms + 抖动0~{ADVANCE_JITTER_MS}ms)")
+
     # 最后 QUIET_SECONDS 纯等待, 一次网络请求都不发(避免吃掉提前量)
     while True:
         remaining = (target_ms - _srv_ms()) / 1000
         if remaining <= QUIET_SECONDS:
             log(f"最后{remaining:.1f}s, 只等待不发请求")
-            gap = (target_ms + ADVANCE_MS - _srv_ms()) / 1000
+            gap = (target_ms + advance_ms - _srv_ms()) / 1000
             if gap > 0:
                 await asyncio.sleep(gap)
             left = (target_ms - _srv_ms()) / 1000
-            log(f"实际提前{left*1000:.0f}ms(设定{abs(ADVANCE_MS)}ms)")
+            log(f"实际提前{left*1000:.0f}ms(设定{abs(advance_ms)}ms)")
             break
         await asyncio.sleep(min(1.0, max(0.05, remaining - QUIET_SECONDS)))
 
     # mock也走真实时间线: 提前ADVANCE_MS开始探针, 开窗瞬间全速(与真实抢购完全一致)
     open_in = (target_ms - _srv_ms()) / 1000
     success = await rapid_purchase(page, goods, open_in=open_in, mock=mock_mode)
+    if not success:
+        log(f"第一轮未成功, {SECOND_DELAY_MS}ms 后二连(直接全速不等开窗)")
+        await asyncio.sleep(SECOND_DELAY_MS / 1000)
+        success = await rapid_purchase(page, goods, open_in=0, mock=mock_mode)
 
     if success:
         log("★ 抢购成功! 请去Chrome中完成支付!")
