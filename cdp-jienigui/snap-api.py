@@ -60,14 +60,15 @@ SECKILL_HOURS = [10, 15]
 # ============================================================
 # 上游(djs-91)抢购策略参数 — 单地域广州 + 提前量 + 开窗全速
 # ============================================================
-INFLIGHT = 15           # 个人账号低并发主流, 并发过高触发频控/订单互斥
+INFLIGHT = 3            # 波次: 每波3地域齐发(Promise.all, Allenalonel/servergrab/yflad真成功全波次)
 POLL_MS = 40            # 看一次结果间隔(毫秒), 只影响发现成功速度
 PRE_OPEN_FIRE_MS = 600  # 开窗前0.6秒全速铺开, 让第一批压在开窗到服务端
-PROBE_MS = 200          # 开窗前探针间隔(毫秒)
-DURATION_SEC = 10       # 持续发送时间(秒)
-ADVANCE_MS = -150       # 压线: 第一波压到开窗0ms到(不提前刷408, 不晚错过), 靠对时保证
-ADVANCE_JITTER_MS = 150 # 提前量随机抖动(0~150ms): 防anti_brush识别固定触发模式(借鉴servergrab rand 200-600ms)
+PROBE_MS = 50           # 开窗前探针间隔(毫秒): 1101001(未开始)不计频控, 密集预热(servergrab20ms留余量)
+DURATION_SEC = 30       # 持续发送时间(秒): 30秒窗口, 售罄才停(Allenalonel)
+ADVANCE_MS = -1200      # 提前1.2s开打: 收1101001(秒杀尚未开始)软性不停, 预热吸收RTT(手册1000-1500ms)
+ADVANCE_JITTER_MS = 300 # 提前量随机抖动(0~300ms): 1200~1500ms窗口内, 防anti_brush识别固定模式
 SECOND_DELAY_MS = 500   # 二连间隔: 第一轮未成功后500ms第二轮直接全速(借鉴servergrab second_delay_ms)
+# 408不退避: 售罄1.9s(10:00实测), 退避=错过窗口, 必须立即继续(其他项目也无408退避)
 QUIET_SECONDS = 15      # 最后15秒纯等待, 一次网络请求都不发
 DO_GOODS_URL = "https://act-api.cloud.tencent.com/dianshi/do-goods"
 
@@ -1164,6 +1165,13 @@ FIRE_JS = """
                         fromUrl: location.href, agent_key: ''},
     });
 
+    // 波次模式: 上一波未全回(等最慢地域)就不发新, 全回才发下一波
+    // (Allenalonel/servergrab用ThreadPool等as_completed全部回来, yflad用Promise.all)
+    if (params.wave && st.inflight > 0) {
+        return {fired: st.fired, inflight: st.inflight, done: st.done,
+                codes: st.codes, msgs: st.msgs, hit: st.hit, fatal: st.fatal,
+                last: st.last};
+    }
     let n = 0;
     while (n < params.batch && st.inflight < params.cap && !st.stopped && !st.hit && !st.fatal) {
         st.inflight++; st.fired++; n++;
@@ -1303,6 +1311,7 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None, mock=
             ramped = True
             params["cap"] = int(INFLIGHT)
             params["batch"] = int(INFLIGHT)
+            params["wave"] = 1   # 波次: 每波3地域齐发, 等全回再下一波
             left = open_at - now
             if left > 0:
                 log(f"  进入最后{PRE_OPEN_FIRE_MS/1000:g}秒, 全速发(距开窗{left:.2f}s)")
@@ -1311,6 +1320,7 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None, mock=
         elif not ramped:
             params["cap"] = 1
             params["batch"] = 1
+            params["wave"] = 0   # 探针阶段: 单条, 非波次
         params["reset"] = False
         try:
             if mock:
